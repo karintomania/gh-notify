@@ -1,17 +1,13 @@
 const std = @import("std");
+const zeit = @import("zeit");
+
 const Allocator = std.mem.Allocator;
 
 const interval_second: usize = 60;
 const max_tries: usize = 60; // 1 min * 60 times
-//
-const DependencyError = error{
-    GhNotInstalled,
-    NotifySendNotInstalled,
-};
 
 pub fn main() !void {
     const pr_id = try parseArgs();
-    try hasDependenciesInstalled();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -21,7 +17,7 @@ pub fn main() !void {
     const url = try getRunUrl(allocator, pr_id);
     defer allocator.free(url);
 
-    try stdout_writer.print("Will send you a notification when action ID: {s} is done!\n", .{pr_id});
+    try stdout_writer.print("Run ID: {s}\n", .{pr_id});
     try stdout_writer.print("Action's URL: {s}\n", .{url});
 
     var i: usize = 0;
@@ -31,14 +27,20 @@ pub fn main() !void {
         defer status.deinit();
 
         const message = try status.toString(allocator);
-        defer allocator.free(message);
+
+        const time = try getTime(allocator);
+
+        try time.strftime(stdout_writer, "[%H:%M] ");
 
         try stdout_writer.print("{s}\n", .{message});
 
         if (status.isFinished()) {
             try callNotifySend(allocator, message);
+            allocator.free(message);
             break;
         }
+
+        allocator.free(message);
 
         // sleep
         std.time.sleep(interval_second * std.time.ns_per_s);
@@ -53,11 +55,19 @@ pub fn main() !void {
     try stdout_writer.print("\nYou can see the result here: {s}\n", .{url});
 }
 
+fn getTime(allocator: Allocator) !zeit.Time {
+    const local_tz = try zeit.loadTimeZone(allocator, .@"Europe/London", null);
+    defer local_tz.deinit();
+
+    const now = try zeit.instant(.{});
+    return now.in(&local_tz).time();
+}
+
 fn parseArgs() ![]const u8 {
     var arg_it = std.process.args();
 
     _ = arg_it.next(); // skip the first argument (the program name)
-    
+
     const pr_id = arg_it.next() orelse {
         std.debug.print("Usage: gh-notify [PR ID].\n", .{});
         return error.InvalidArgument;
@@ -66,58 +76,18 @@ fn parseArgs() ![]const u8 {
     return pr_id;
 }
 
-fn hasDependenciesInstalled() !void {
-    var buf: [50*1024]u8 = undefined;
-
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const allocator = fba.allocator();
-
-    _ = std.process.Child.run(.{ .allocator=allocator, .argv = &.{ "gh", "--version" } }) catch |err| {
-        if (err == error.NotDir) {
-            std.debug.print("Make sure gh command is installed.\n", .{});
-            return DependencyError.GhNotInstalled;
-        } else {
-            return err;
-        }
-    };
-
-    _ = std.process.Child.run(.{ .allocator=allocator, .argv = &.{ "notify-send", "--version" } }) catch |err| {
-        if (err == error.NotDir) {
-            std.debug.print("Make sure notify-send command is installed.\n", .{});
-            return DependencyError.NotifySendNotInstalled;
-        } else {
-            return err;
-        }
-    };
-}
-
 fn getRunUrl(allocator: Allocator, run_id: []const u8) ![]const u8 {
-    const RunUrl = struct {url: []const u8};
-    const argv: []const []const u8 = &.{"gh", "run",  "view", run_id, "--json", "url"};
+    const argv: []const []const u8 = &.{ "gh", "run", "view", run_id, "--json", "url", "--jq", ".url" };
 
-    const output = try callGh(allocator, argv);
-    defer allocator.free(output);
-
-    const parsed = try std.json.parseFromSlice(
-        RunUrl,
-        allocator,
-        output,
-        .{},
-    );
-
-    parsed.deinit();
-
-    const url = allocator.dupe(u8, parsed.value.url);
+    const url = try execute(allocator, argv);
 
     return url;
 }
 
-
 fn getRunStatus(allocator: Allocator, run_id: []const u8) !Status {
-    const argv: []const []const u8 = &.{"gh", "run",  "view", run_id, "--json", "status,conclusion,workflowName"};
+    const argv: []const []const u8 = &.{ "gh", "run", "view", run_id, "--json", "status,conclusion,workflowName" };
 
-    const output = try callGh(allocator, argv);
-
+    const output = try execute(allocator, argv);
     defer allocator.free(output);
 
     const status = try Status.init(output, allocator);
@@ -125,41 +95,39 @@ fn getRunStatus(allocator: Allocator, run_id: []const u8) !Status {
     return status;
 }
 
-fn callGh(allocator: Allocator, argv: []const []const u8) ![]u8 {
-    const result = try std.process.Child.run(.{.allocator = allocator,
+fn execute(allocator: Allocator, argv: []const []const u8) ![]u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
         .argv = argv,
-    });
+    }) catch |err| {
+        // probably the command is not installed
+        std.debug.print("Failed to run {s} command: {any}\nMake sure {s} is installed on your machine.\n", .{
+            argv[0],
+            err,
+            argv[0],
+        });
+        return error.CommandFailed;
+    };
 
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     if (result.stderr.len != 0) {
-        std.debug.print("gh command failed with error: {s}\n", .{result.stderr});
+        std.debug.print("{s} command failed with error: {s}\n", .{ argv[0], result.stderr });
         return error.CommandFailed;
     }
 
-    const output= try allocator.dupe(u8, result.stdout);
+    const output = try allocator.dupe(u8, result.stdout);
 
     return output;
 }
 
 fn callNotifySend(allocator: Allocator, message: []const u8) !void {
-    const argv: []const []const u8 = &.{"notify-send", message};
+    const argv: []const []const u8 = &.{ "notify-send", message };
 
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-    });
-
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.stderr.len != 0) {
-        std.debug.print("notify-send error: {s}\n", .{result.stderr});
-        return error.CommandFailed;
-    }
+    const output = try execute(allocator, argv);
+    defer allocator.free(output);
 }
-
 
 const Status = struct {
     arena: std.heap.ArenaAllocator,
@@ -172,10 +140,9 @@ const Status = struct {
 
         const owned_str = try arena.allocator().dupe(u8, str);
 
-        // const ParsedValues = ;
         const parsed = try std.json.parseFromSliceLeaky(
-            struct {status: []const u8, conclusion: []const u8, workflowName: []const u8},
-            // ParsedValues,
+            // temporary struct to hold the parsed data
+            struct { status: []const u8, conclusion: []const u8, workflowName: []const u8 },
             arena.allocator(),
             owned_str,
             .{},
@@ -199,25 +166,25 @@ const Status = struct {
 
     pub fn toString(self: Status, allocator: Allocator) ![]const u8 {
         if (self.isFinished()) {
-            const symbol = if (std.mem.eql(u8, self.conclusion,"success")) "✅" else "❌";
-            const str = try std.fmt.allocPrint(allocator, "Task completed with {s} {s}, Workflow Name: {s}", .{
-                self.conclusion,
+            const symbol = if (std.mem.eql(u8, self.conclusion, "success")) "✅" else "❌";
+            const str = try std.fmt.allocPrint(allocator, "{s} Task completed with {s}, Workflow Name: {s}", .{
                 symbol,
+                self.conclusion,
                 self.workflowName,
             });
             return str;
         } else {
-            const str = try std.fmt.allocPrint(allocator, "Still running {s}...", .{
-            self.workflowName,
+            const str = try std.fmt.allocPrint(allocator, "⏳ Still running {s}...", .{
+                self.workflowName,
             });
             return str;
         }
     }
 };
 
-
 test "status in progress" {
-    const input = \\{ "conclusion": "", "status": "in_progress", "workflowName": "Automated Tests" }
+    const input =
+        \\{ "conclusion": "", "status": "in_progress", "workflowName": "Automated Tests" }
     ;
 
     const result = try Status.init(input, std.testing.allocator);
@@ -231,12 +198,12 @@ test "status in progress" {
     const str_result = try result.toString(std.testing.allocator);
     defer std.testing.allocator.free(str_result);
 
-    try std.testing.expectEqualStrings(str_result, "Still running Automated Tests...");
+    try std.testing.expectEqualStrings(str_result, "⏳ Still running Automated Tests...");
 }
 
 test "status success output" {
-
-    const input = \\{ "conclusion": "success", "status": "completed", "workflowName": "Automated Tests" }
+    const input =
+        \\{ "conclusion": "success", "status": "completed", "workflowName": "Automated Tests" }
     ;
 
     const result = try Status.init(input, std.testing.allocator);
@@ -249,12 +216,12 @@ test "status success output" {
     const str_result = try result.toString(std.testing.allocator);
     defer std.testing.allocator.free(str_result);
 
-    try std.testing.expectEqualStrings(str_result, "Task completed with success ✅, Workflow Name: Automated Tests");
+    try std.testing.expectEqualStrings(str_result, "✅ Task completed with success, Workflow Name: Automated Tests");
 }
 
 test "status failure output" {
-
-    const input = \\{ "conclusion": "failure", "status": "completed", "workflowName": "Automated Tests" }
+    const input =
+        \\{ "conclusion": "failure", "status": "completed", "workflowName": "Automated Tests" }
     ;
 
     const result = try Status.init(input, std.testing.allocator);
@@ -267,5 +234,5 @@ test "status failure output" {
     const str_result = try result.toString(std.testing.allocator);
     defer std.testing.allocator.free(str_result);
 
-    try std.testing.expectEqualStrings(str_result, "Task completed with failure ❌, Workflow Name: Automated Tests");
+    try std.testing.expectEqualStrings(str_result, "❌ Task completed with failure, Workflow Name: Automated Tests");
 }
